@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
+  ServerSettingsError,
   ThreadId,
   type OrchestrationV2ThreadShell,
   type Project as ProjectRecord,
@@ -20,8 +21,6 @@ import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts"
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
-import * as TerminalManager from "../../../terminal/Manager.ts";
-import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRunner.ts";
 import * as Project from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
@@ -507,122 +506,140 @@ it.effect("a launch into a new worktree creates nothing when its base ref has no
   }),
 );
 
-it.effect(
-  "scripts set through t3_project_update are what setup resolves under folded settings",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const sourceThreadId = ThreadId.make("source-thread");
-        const projectId = ProjectId.make("project:folded");
-        const providerInstanceId = ProviderInstanceId.make("codex");
-        const caller = {
-          id: sourceThreadId,
-          projectId,
-          providerInstanceId,
-          modelSelection: { instanceId: providerInstanceId, model: "gpt-5" },
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          activeRunId: "active-run",
-          archivedAt: null,
-          deletedAt: null,
-        } as OrchestrationV2ThreadShell;
-        let project = {
-          id: projectId,
-          title: "Folded",
-          workspaceRoot: "/repo",
-          defaultModelSelection: null,
-          scripts: [] as ReadonlyArray<ProjectRecord["scripts"][number]>,
-          createdAt: "2026-10-01T00:00:00.000Z",
-          updatedAt: "2026-10-01T00:00:00.000Z",
-          deletedAt: null,
-        } as ProjectRecord;
-        const updates: Array<unknown> = [];
-        const written: Array<string> = [];
-        const context = yield* Layer.build(
-          Layer.mergeAll(
-            ServerSettings.layerTest({ projectSettingsFolded: true }),
-            NodeCrypto.layer,
-            Layer.succeed(McpInvocationContext.McpInvocationContext, {
-              environmentId: EnvironmentId.make("environment"),
-              requestNamespace: "session",
-              thread: {
-                threadId: sourceThreadId,
-                providerSessionId: "session",
-                providerInstanceId,
-              },
-              client: undefined,
-              issuedAt: 0,
-              capabilities: new Set(["orchestration" as const]),
-            }),
-            Layer.mock(ThreadManagement.ThreadManagementService)({
-              getThreadShell: () => Effect.succeed(caller),
-            }),
-            Layer.mock(Project.ProjectService)({
-              getById: () => Effect.succeed(Option.some(project)),
-              update: (input) =>
-                Effect.sync(() => {
-                  updates.push(input);
-                  project = { ...project, ...(input.scripts ? { scripts: input.scripts } : {}) };
-                  return project;
-                }),
-            }),
-            Layer.mock(TerminalManager.TerminalManager)({
-              open: (input) =>
-                Effect.succeed({
-                  threadId: input.threadId,
-                  terminalId: input.terminalId,
-                  cwd: input.cwd,
-                  worktreePath: input.worktreePath ?? null,
-                  status: "running" as const,
-                  pid: 1,
-                  history: "",
-                  exitCode: null,
-                  exitSignal: null,
-                  label: "Shell",
-                  updatedAt: "2026-10-01T00:00:00.000Z",
-                }),
-              write: (input) => Effect.sync(() => void written.push(input.data)),
-              subscribe: () => Effect.succeed(() => undefined),
-              closeIdle: () => Effect.void,
-            }),
+const effectiveReads = (
+  settings: Layer.Layer<ServerSettings.ServerSettingsService, ServerSettingsError>,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const sourceThreadId = ThreadId.make("source-thread");
+      const projectId = ProjectId.make("project:folded");
+      const providerInstanceId = ProviderInstanceId.make("codex");
+      const caller = {
+        id: sourceThreadId,
+        projectId,
+        providerInstanceId,
+        modelSelection: { instanceId: providerInstanceId, model: "gpt-5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        activeRunId: "active-run",
+        archivedAt: null,
+        deletedAt: null,
+      } as OrchestrationV2ThreadShell;
+      const project = {
+        id: projectId,
+        title: "Folded",
+        workspaceRoot: "/repo",
+        defaultModelSelection: null,
+        autoPull: false,
+        scripts: [],
+        createdAt: "2026-10-01T00:00:00.000Z",
+        updatedAt: "2026-10-01T00:00:00.000Z",
+        deletedAt: null,
+      } as ProjectRecord;
+      const updates: Array<unknown> = [];
+      const context = yield* Layer.build(
+        Layer.mergeAll(
+          settings,
+          NodeCrypto.layer,
+          Layer.succeed(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("environment"),
+            requestNamespace: "session",
+            thread: {
+              threadId: sourceThreadId,
+              providerSessionId: "session",
+              providerInstanceId,
+            },
+            client: undefined,
+            issuedAt: 0,
+            capabilities: new Set(["orchestration" as const]),
+          }),
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(caller),
+          }),
+          Layer.mock(Project.ProjectService)({
+            getById: () => Effect.succeed(Option.some(project)),
+            snapshot: Effect.succeed({ projects: [project], updatedAt: project.updatedAt }),
+            update: (input) => Effect.sync(() => void updates.push(input)).pipe(Effect.as(project)),
+          }),
+        ),
+      );
+      const dependencies = Layer.succeedContext(context);
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+            Layer.provide(dependencies),
           ),
-        );
-        const dependencies = Layer.succeedContext(context);
-        const toolkit = yield* ProjectToolkit.pipe(
-          Effect.provide(
-            McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
-              Layer.provide(dependencies),
-            ),
-          ),
-        );
-        const call = (name: "t3_project_update" | "t3_project_read", params: object) =>
-          toolkit
-            .handle(name, params as never)
-            .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
-        const script = {
-          id: "setup",
-          name: "Setup",
-          command: "bash scripts/setup.sh",
-          icon: "configure" as const,
-          runOnWorktreeCreate: true,
-        };
+        ),
+      );
+      const call = (
+        name: "t3_project_update" | "t3_project_read" | "t3_project_list",
+        params: object,
+      ) =>
+        toolkit
+          .handle(name, params as never)
+          .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+      return {
+        updates,
+        update: call("t3_project_update", { projectId, scripts: [] }),
+        read: call("t3_project_read", { projectId }),
+        list: call("t3_project_list", {}),
+      };
+    }),
+  );
 
-        const updated = yield* call("t3_project_update", { projectId, scripts: [script] });
-        expect(updated.at(-1)?.result).toMatchObject({ scripts: [script] });
-        expect(updates).toEqual([expect.not.objectContaining({ scripts: expect.anything() })]);
-        const read = yield* call("t3_project_read", { projectId });
-        expect(read.at(-1)?.result).toMatchObject({ scripts: [script] });
+const setupScript = {
+  id: "setup",
+  name: "Setup",
+  command: "bash scripts/setup.sh",
+  icon: "configure" as const,
+  runOnWorktreeCreate: true,
+};
 
-        const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
-          Effect.provide(ProjectSetupScriptRunner.layer.pipe(Layer.provide(dependencies))),
-        );
-        const started = yield* runner.runForThread({
-          threadId: "thread-folded",
-          projectId,
-          worktreePath: "/repo-worktree",
-        });
-        expect(started).toMatchObject({ status: "started", scriptId: "setup" });
-        expect(written).toEqual([" bash scripts/setup.sh\r"]);
+it.effect("project reads and updates report the settings that effectively apply", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:folded");
+    const model = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.1-codex" };
+    const calls = yield* effectiveReads(
+      ServerSettings.layerTest({
+        projectSettingsFolded: true,
+        projectSettingsOverrides: {
+          [projectId]: {
+            defaultProjectScripts: [setupScript],
+            defaultModelSelection: model,
+            defaultThreadEnvMode: "worktree",
+            defaultAutoPull: true,
+          },
+        },
       }),
-    ),
+    );
+    const effective = {
+      scripts: [setupScript],
+      defaultModelSelection: model,
+      defaultThreadEnvMode: "worktree",
+      autoPull: true,
+    };
+    expect((yield* calls.read).at(-1)?.result).toMatchObject(effective);
+    expect((yield* calls.update).at(-1)?.result).toMatchObject(effective);
+    expect(calls.updates).toEqual([expect.objectContaining({ projectId, scripts: [] })]);
+    expect((yield* calls.list).at(-1)?.result).toMatchObject({ projects: [effective] });
+  }),
+);
+
+it.effect("a settings read failure does not break a plain project read", () =>
+  Effect.gen(function* () {
+    const calls = yield* effectiveReads(
+      Layer.mock(ServerSettings.ServerSettingsService)({
+        getSettings: Effect.fail(
+          new ServerSettingsError({
+            settingsPath: "/settings.json",
+            operation: "read-secret",
+          }),
+        ),
+      }),
+    );
+    expect((yield* calls.read).at(-1)?.result).toMatchObject({ title: "Folded", scripts: [] });
+    expect((yield* calls.list).at(-1)?.result).toMatchObject({
+      projects: [{ title: "Folded", scripts: [] }],
+    });
+  }),
 );

@@ -63,7 +63,7 @@ const ProjectReadTool = Tool.make("t3_project_read", {
   ...shared,
   dependencies: settingsDependencies,
   description:
-    "Read a registered project in this environment, including its workspace and the scripts that effectively run for it.",
+    "Read a registered project in this environment, including its workspace and the scripts and defaults that effectively apply to it.",
   parameters: Schema.Struct({ projectId: ProjectId }),
 })
   .annotate(Tool.Readonly, true)
@@ -77,13 +77,13 @@ const ProjectCreateTool = Tool.make("t3_project_create", {
     workspaceRoot: Schema.optional(ProjectCreatePayload.fields.workspaceRoot),
   }),
   success: Schema.Struct({ ...Project.fields, commitError: Schema.optional(Schema.String) }),
-  dependencies: [...shared.dependencies, ManagedProjectFolders.ManagedProjectFolders],
+  dependencies: [...settingsDependencies, ManagedProjectFolders.ManagedProjectFolders],
 }).annotate(Tool.Destructive, true);
 const ProjectUpdateTool = Tool.make("t3_project_update", {
   ...shared,
   dependencies: settingsDependencies,
   description:
-    "Update a registered project's settings. Omitted fields are preserved. Scripts are saved where the app's project actions live, so they take effect for new worktrees and settles.",
+    "Update a registered project's settings. Omitted fields are preserved. Scripts and defaults are saved where the app's project settings live, so they take effect for new worktrees and settles.",
   parameters: Schema.Struct({ projectId: ProjectId, ...ProjectUpdatePayload.fields }),
 }).annotate(Tool.Destructive, true);
 const ProjectDeleteTool = Tool.make("t3_project_delete", {

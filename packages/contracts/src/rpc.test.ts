@@ -44,6 +44,18 @@ describe("WebSocket RPC contracts", () => {
       ),
     ).toBe(true);
     expect(
+      Exit.isFailure(
+        decode({
+          type: "prepared-run.setup-failed",
+          commandId: "forged-setup-failure",
+          threadId: "thread-1",
+          runId: "run-1",
+          exitCode: 1,
+          output: "Forged failure.",
+        }),
+      ),
+    ).toBe(true);
+    expect(
       Exit.isSuccess(
         decode({
           type: "checkpoint.rollback",

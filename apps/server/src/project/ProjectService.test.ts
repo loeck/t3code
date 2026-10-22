@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { CommandId, type Project, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
+import { resolveProjectScripts } from "@t3tools/shared/projectScripts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -55,13 +56,14 @@ const layerTestFor = (
     | ProjectFaviconResolver.ProjectFaviconResolver
     | RepositoryIdentityResolver.RepositoryIdentityResolver
   >,
+  settings: Parameters<typeof ServerSettings.layerTest>[0] = {},
 ) =>
   RuntimeLayer.layerProjectService.pipe(
     Layer.provideMerge(ProjectEnrichmentService.layer),
     Layer.provideMerge(layerWorkspacePaths),
     Layer.provideMerge(projectMetadataLayer),
     Layer.provideMerge(SqlitePersistence.layerMemory),
-    Layer.provideMerge(ServerSettings.layerTest()),
+    Layer.provideMerge(ServerSettings.layerTest(settings)),
     Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "project-service-test-" })),
     Layer.provide(NodeServices.layer),
   );
@@ -126,6 +128,7 @@ it.layer(layerTest)("ProjectService", (it) => {
         ],
       });
       assert.equal(created.workspaceRoot, "/work/project");
+      assert.deepEqual(created.defaultModelSelection, modelSelection);
       assert.isNull(created.repositoryIdentity);
       assert.isNull(created.faviconPath);
 
@@ -197,7 +200,13 @@ it.layer(layerTest)("ProjectService", (it) => {
       `;
       assert.deepEqual(
         changes.map((change) => change.event_type),
-        ["project.created", "project.meta-updated", "project.meta-updated", "project.deleted"],
+        [
+          "project.created",
+          "project.meta-updated",
+          "project.meta-updated",
+          "project.meta-updated",
+          "project.deleted",
+        ],
       );
     }),
   );
@@ -481,6 +490,126 @@ it.layer(layerTest)("ProjectService", (it) => {
       assert.equal(leftovers[0]?.count, 0);
       yield* sql`DROP TRIGGER fail_project_row`;
       assert.equal((yield* service.create(input)).id, projectId);
+    }),
+  );
+});
+
+const projectEvents = (projectId: ProjectId) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<{ readonly event_type: string }>`
+      SELECT event_type FROM orchestration_events
+      WHERE aggregate_kind = 'project' AND stream_id = ${projectId} ORDER BY sequence ASC
+    `;
+    return rows.map((row) => row.event_type);
+  });
+
+const foldedProjectId = ProjectId.make("project:folded-settings");
+const setupScript = {
+  id: "setup",
+  name: "Setup",
+  command: "bash scripts/setup.sh",
+  icon: "configure",
+  runOnWorktreeCreate: true,
+} as const;
+const foldedModel = {
+  instanceId: ProviderInstanceId.make("codex_custom"),
+  model: "gpt-5.1-codex",
+} as const;
+
+it.layer(
+  layerTestFor(layerMetadata, {
+    projectSettingsFolded: true,
+    projectSettingsOverrides: {
+      [foldedProjectId]: { enableAgentBrowserAccess: true, defaultThreadEnvMode: "worktree" },
+    },
+  }),
+)("ProjectService with folded project settings", (it) => {
+  it.effect("writes scripts and defaults into the override entry, not the row", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectService.ProjectService;
+      const settings = yield* ServerSettings.ServerSettingsService;
+      const created = yield* service.create({
+        commandId: CommandId.make("command:folded:create"),
+        projectId: foldedProjectId,
+        title: "Folded",
+        workspaceRoot: "/work/folded",
+        defaultModelSelection: foldedModel,
+        scripts: [setupScript],
+      });
+      assert.deepEqual(created.scripts, []);
+      assert.isNull(created.defaultModelSelection);
+      assert.deepEqual(yield* projectEvents(foldedProjectId), ["project.created"]);
+      assert.deepEqual((yield* settings.getSettings).projectSettingsOverrides[foldedProjectId], {
+        enableAgentBrowserAccess: true,
+        defaultThreadEnvMode: "worktree",
+        defaultModelSelection: foldedModel,
+        defaultProjectScripts: [setupScript],
+      });
+
+      const updated = yield* service.update({
+        commandId: CommandId.make("command:folded:update"),
+        projectId: foldedProjectId,
+        autoPull: true,
+        defaultThreadEnvMode: null,
+        defaultModelSelection: null,
+      });
+      assert.deepEqual(yield* projectEvents(foldedProjectId), ["project.created"]);
+      assert.isFalse(updated.autoPull);
+      const current = yield* settings.getSettings;
+      assert.deepEqual(current.projectSettingsOverrides[foldedProjectId], {
+        enableAgentBrowserAccess: true,
+        defaultProjectScripts: [setupScript],
+        defaultAutoPull: true,
+      });
+      assert.deepEqual(resolveProjectScripts(current, updated), [setupScript]);
+
+      yield* service.update({
+        commandId: CommandId.make("command:folded:rename"),
+        projectId: foldedProjectId,
+        title: "Renamed",
+        scripts: [],
+      });
+      assert.deepEqual(yield* projectEvents(foldedProjectId), [
+        "project.created",
+        "project.meta-updated",
+      ]);
+      assert.deepEqual(
+        (yield* settings.getSettings).projectSettingsOverrides[foldedProjectId]
+          ?.defaultProjectScripts,
+        [],
+      );
+    }),
+  );
+});
+
+it.layer(
+  layerTestFor(layerMetadata, {
+    projectSettingsOverrides: { [foldedProjectId]: { enableAgentBrowserAccess: true } },
+  }),
+)("ProjectService with an unfolded override entry", (it) => {
+  it.effect("keeps writing the override entry the app reads first", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectService.ProjectService;
+      const settings = yield* ServerSettings.ServerSettingsService;
+      yield* service.create({
+        commandId: CommandId.make("command:unfolded:create"),
+        projectId: foldedProjectId,
+        title: "Unfolded",
+        workspaceRoot: "/work/unfolded",
+      });
+      const updated = yield* service.update({
+        commandId: CommandId.make("command:unfolded:update"),
+        projectId: foldedProjectId,
+        scripts: [setupScript],
+      });
+      assert.deepEqual(updated.scripts, []);
+      assert.deepEqual(yield* projectEvents(foldedProjectId), ["project.created"]);
+      assert.deepEqual(
+        (yield* settings.getSettings).projectSettingsOverrides[foldedProjectId]
+          ?.defaultProjectScripts,
+        [setupScript],
+      );
     }),
   );
 });

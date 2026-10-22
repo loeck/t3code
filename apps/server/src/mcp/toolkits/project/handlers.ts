@@ -1,19 +1,12 @@
-import {
-  MessageId,
-  ThreadId,
-  OrchestratorMcpFailure,
-  ProjectId,
-  type Project as ProjectRecord,
-} from "@t3tools/contracts";
+import { MessageId, ThreadId, OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
 import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
-import { resolveProjectScripts } from "@t3tools/shared/projectScripts";
+import * as EffectiveProjectSettings from "../../../project/EffectiveProjectSettings.ts";
 import * as Project from "../../../project/ProjectService.ts";
-import * as ServerSettings from "../../../serverSettings.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as Repositories from "../../../sourceControl/SourceControlRepositoryService.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
@@ -52,20 +45,6 @@ const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
       message:
         "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
     });
-});
-
-/**
- * With folded project settings the legacy `project.scripts` field is ignored
- * at run time, so reads must report what actually runs.
- */
-const withEffectiveScripts = Effect.fn("mcp.withEffectiveScripts")(function* (
-  project: ProjectRecord,
-) {
-  const settings = yield* ServerSettings.ServerSettingsService.pipe(
-    Effect.flatMap((service) => service.getSettings),
-    Effect.mapError(unavailable),
-  );
-  return { ...project, scripts: resolveProjectScripts(settings, project) };
 });
 
 const access = Effect.gen(function* () {
@@ -212,7 +191,9 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       const start = input.cursor ?? 0,
         end = start + (input.limit ?? 20);
       return {
-        projects: yield* Effect.forEach(rows.slice(start, end), withEffectiveScripts),
+        projects: yield* EffectiveProjectSettings.withEffectiveProjectsSettings(
+          rows.slice(start, end),
+        ),
         nextCursor: end < rows.length ? end : null,
       };
     }),
@@ -226,15 +207,15 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           code: "invalid_request",
           message: "The project was not found.",
         });
-      return yield* withEffectiveScripts(result.value);
+      return yield* EffectiveProjectSettings.withEffectiveProjectSettingsOf(result.value);
     }),
   ),
   t3_project_create: McpToolAccess.writesEnvironment(({ workspaceRoot, ...input }) =>
     Effect.gen(function* () {
       const projects = yield* Project.ProjectService;
       if (workspaceRoot === undefined) {
-        // Project creation records no model default (only an update does), so
-        // reject what this mode would otherwise drop silently.
+        // A project started from its title is made by the folder service, which
+        // takes only a name, so reject what this mode would otherwise drop silently.
         if (
           input.scripts !== undefined ||
           input.createWorkspaceRootIfMissing !== undefined ||
@@ -263,54 +244,24 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             ),
           );
         return {
-          ...project,
+          ...(yield* EffectiveProjectSettings.withEffectiveProjectSettingsOf(project)),
           ...(created.commitError === undefined ? {} : { commitError: created.commitError }),
         };
       }
       const commandId = yield* newCommandId();
-      return yield* projects
+      const created = yield* projects
         .create({ ...input, workspaceRoot, commandId, projectId: ProjectId.make(commandId) })
         .pipe(Effect.mapError(projectFailure));
+      return yield* EffectiveProjectSettings.withEffectiveProjectSettingsOf(created);
     }),
   ),
   t3_project_update: McpToolAccess.writesEnvironment((input) =>
     Effect.gen(function* () {
       const projects = yield* Project.ProjectService;
-      const { scripts, ...metadata } = input;
-      const serverSettings = yield* ServerSettings.ServerSettingsService;
-      const settings = yield* serverSettings.getSettings.pipe(Effect.mapError(unavailable));
-      // Folded settings read scripts only from the settings store, never from
-      // `project.scripts`, so the write goes where the app's project actions do.
-      const foldedScripts = settings.projectSettingsFolded ? scripts : undefined;
-      if (foldedScripts !== undefined) {
-        const existing = yield* projects
-          .getById(input.projectId)
-          .pipe(Effect.mapError(unavailable));
-        if (Option.isNone(existing))
-          return yield* new OrchestratorMcpFailure({
-            code: "invalid_request",
-            message: "The project was not found.",
-          });
-      }
       const updated = yield* projects
-        .update({
-          ...metadata,
-          ...(scripts === undefined || foldedScripts !== undefined ? {} : { scripts }),
-          commandId: yield* newCommandId(),
-        })
+        .update({ ...input, commandId: yield* newCommandId() })
         .pipe(Effect.mapError(projectFailure));
-      if (foldedScripts !== undefined)
-        yield* serverSettings
-          .updateSettings({
-            projectSettingsOverrides: {
-              [input.projectId]: {
-                ...settings.projectSettingsOverrides[input.projectId],
-                defaultProjectScripts: foldedScripts,
-              },
-            },
-          })
-          .pipe(Effect.mapError(unavailable));
-      return yield* withEffectiveScripts(updated);
+      return yield* EffectiveProjectSettings.withEffectiveProjectSettingsOf(updated);
     }),
   ),
   t3_project_delete: McpToolAccess.writesEnvironment((input) =>

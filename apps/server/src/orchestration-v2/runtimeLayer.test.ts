@@ -4380,6 +4380,86 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("records an async setup failure on the released preparation item only", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-layer-setup-failed-thread");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("setup-failed-create"),
+        threadId,
+        projectId: ProjectId.make("setup-failed-project"),
+        title: "Setup failure",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/runtime-layer-setup-failed",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("setup-failed-message"),
+        threadId,
+        messageId: MessageId.make("setup-failed-message"),
+        text: "Prepare my workspace.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "defer_start" },
+      });
+      const runId = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!.id;
+      const setupFailed = (commandId: string) => ({
+        type: "prepared-run.setup-failed" as const,
+        commandId: CommandId.make(commandId),
+        threadId,
+        runId,
+        exitCode: null,
+        output: 'Setup script "Setup" exited with no exit code.',
+      });
+
+      const early = yield* orchestrator
+        .dispatch(setupFailed("setup-failed-early"))
+        .pipe(Effect.flip);
+      assert.equal(early._tag, "OrchestratorDispatchError");
+
+      yield* orchestrator.dispatch({
+        type: "prepared-run.release",
+        commandId: CommandId.make("setup-failed-release"),
+        threadId,
+        runId,
+      });
+      yield* orchestrator.dispatch(setupFailed("setup-failed-first"));
+      const failedItem = () =>
+        orchestrator
+          .getThreadProjection(threadId)
+          .pipe(
+            Effect.map((projection) =>
+              projection.turnItems.find((item) => item.type === "command_execution"),
+            ),
+          );
+      const first = yield* failedItem();
+      assert.equal(first?.status, "failed");
+      assert.equal(first?.title, "Workspace ready, setup script failed");
+      assert.equal(first?.type === "command_execution" ? first.exitCode : 0, undefined);
+      assert.equal(
+        first?.type === "command_execution" ? first.output : "",
+        setupFailed("x").output,
+      );
+
+      const replayed = yield* orchestrator.dispatch(setupFailed("setup-failed-first"));
+      assert.deepEqual(yield* failedItem(), first);
+      assert.isAtLeast(replayed.sequence, 1);
+      const repeated = yield* orchestrator
+        .dispatch(setupFailed("setup-failed-again"))
+        .pipe(Effect.flip);
+      assert.equal(repeated._tag, "OrchestratorDispatchError");
+      assert.deepEqual(yield* failedItem(), first);
+    }),
+  );
+
   it.effect("cancels queued work when a thread is archived", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

@@ -4,8 +4,10 @@ import {
   ProjectId,
   type Project,
   type ProjectCreatePayload,
+  type ProjectSettingsOverrides,
   type ProjectUpdatePayload,
   type ProjectSnapshot,
+  type ServerSettings as ServerSettingsValue,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
@@ -93,6 +95,7 @@ export class ProjectOperationError extends Schema.TaggedError<ProjectOperationEr
       "list-threads",
       "delete-thread",
       "dispatch-project-command",
+      "update-settings",
     ]),
     projectId: Schema.optional(ProjectId),
     workspaceRoot: Schema.optional(Schema.String),
@@ -109,6 +112,42 @@ export type ProjectServiceError =
   | ProjectConflictError
   | ProjectNotEmptyError
   | ProjectOperationError;
+
+type ProjectSettingFields = Pick<
+  ProjectUpdatePayload,
+  "defaultModelSelection" | "defaultThreadEnvMode" | "autoPull" | "scripts"
+>;
+
+/**
+ * A null default means "inherit", which the override store spells as an absent key.
+ */
+function projectSettingsChanges(fields: ProjectSettingFields) {
+  const set: ProjectSettingsOverrides = {
+    ...(fields.defaultModelSelection
+      ? { defaultModelSelection: fields.defaultModelSelection }
+      : {}),
+    ...(fields.defaultThreadEnvMode ? { defaultThreadEnvMode: fields.defaultThreadEnvMode } : {}),
+    ...(fields.autoPull === undefined ? {} : { defaultAutoPull: fields.autoPull }),
+    ...(fields.scripts === undefined ? {} : { defaultProjectScripts: fields.scripts }),
+  };
+  const unset: Array<keyof ProjectSettingsOverrides> = [
+    ...(fields.defaultModelSelection === null ? (["defaultModelSelection"] as const) : []),
+    ...(fields.defaultThreadEnvMode === null ? (["defaultThreadEnvMode"] as const) : []),
+  ];
+  return { set, unset };
+}
+
+/**
+ * Runtime settings read a project's scripts, default model, thread mode and
+ * auto-pull from its override entry once the legacy project fields were folded
+ * into the store, or an entry already exists. Only then does a write there
+ * take effect; the project row is the home before that.
+ */
+function usesOverrideStore(settings: ServerSettingsValue, projectId: ProjectId): boolean {
+  return (
+    settings.projectSettingsFolded || settings.projectSettingsOverrides[projectId] !== undefined
+  );
+}
 
 export class ProjectService extends Context.Service<
   ProjectService,
@@ -325,6 +364,22 @@ export const make = Effect.gen(function* () {
     return Option.isNone(row) ? Option.none() : Option.some(yield* hydrate(row.value));
   });
 
+  const readSettings = serverSettings.getSettings.pipe(
+    Effect.mapError((cause) => new ProjectOperationError({ operation: "update-settings", cause })),
+  );
+
+  const patchOverrides = (
+    projectId: ProjectId,
+    changes: ReturnType<typeof projectSettingsChanges>,
+  ) =>
+    serverSettings
+      .patchProjectSettingsOverrides(projectId, changes)
+      .pipe(
+        Effect.mapError(
+          (cause) => new ProjectOperationError({ operation: "update-settings", projectId, cause }),
+        ),
+      );
+
   const create: ProjectService["Service"]["create"] = Effect.fn("ProjectService.create")(
     function* (input) {
       const workspaceRoot = yield* normalizeWorkspaceRoot({
@@ -332,14 +387,28 @@ export const make = Effect.gen(function* () {
         workspaceRoot: input.workspaceRoot,
         createIfMissing: input.createWorkspaceRootIfMissing ?? false,
       });
+      const fields = { defaultModelSelection: input.defaultModelSelection, scripts: input.scripts };
+      const inOverrideStore =
+        (fields.defaultModelSelection ?? fields.scripts) !== undefined &&
+        usesOverrideStore(yield* readSettings, input.projectId);
       yield* commit({
         type: "project.create",
         commandId: input.commandId,
         projectId: input.projectId,
         title: input.title,
         workspaceRoot,
-        ...(input.scripts === undefined ? {} : { scripts: input.scripts }),
+        ...(input.scripts === undefined || inOverrideStore ? {} : { scripts: input.scripts }),
       });
+      if (inOverrideStore) {
+        yield* patchOverrides(input.projectId, projectSettingsChanges(fields));
+      } else if (input.defaultModelSelection) {
+        yield* commit({
+          type: "project.meta.update",
+          commandId: CommandId.make(`${input.commandId}:defaults`),
+          projectId: input.projectId,
+          defaultModelSelection: input.defaultModelSelection,
+        });
+      }
       yield* projectEnrichment.invalidate([workspaceRoot]);
       return yield* readCommitted(input.projectId);
     },
@@ -359,23 +428,44 @@ export const make = Effect.gen(function* () {
               projectId: input.projectId,
               workspaceRoot: input.workspaceRoot,
             });
-      yield* commit({
-        type: "project.meta.update",
-        commandId: input.commandId,
-        projectId: input.projectId,
+      const changes = projectSettingsChanges(input);
+      const hasSettingChanges = Object.keys(changes.set).length > 0 || changes.unset.length > 0;
+      const settings = hasSettingChanges ? yield* readSettings : undefined;
+      const inOverrideStore =
+        settings !== undefined && usesOverrideStore(settings, input.projectId);
+      // Before the fold the row's own defaults still resolve under an entry
+      // that lacks the key, so inheriting must clear them there too.
+      const rowFields: ProjectSettingFields = !inOverrideStore
+        ? input
+        : settings.projectSettingsFolded
+          ? {}
+          : {
+              ...(input.defaultModelSelection === null ? { defaultModelSelection: null } : {}),
+              ...(input.defaultThreadEnvMode === null ? { defaultThreadEnvMode: null } : {}),
+            };
+      const meta = {
         ...(input.title === undefined ? {} : { title: input.title }),
         ...(workspaceRoot === previousRoot ? {} : { workspaceRoot }),
-        ...(input.defaultModelSelection === undefined
-          ? {}
-          : { defaultModelSelection: input.defaultModelSelection }),
-        ...(input.autoPull === undefined ? {} : { autoPull: input.autoPull }),
         ...(input.projectIcon === undefined ? {} : { projectIcon: input.projectIcon }),
         ...(input.faviconPath === undefined ? {} : { faviconPath: input.faviconPath }),
-        ...(input.defaultThreadEnvMode === undefined
+        ...(rowFields.defaultModelSelection === undefined
           ? {}
-          : { defaultThreadEnvMode: input.defaultThreadEnvMode }),
-        ...(input.scripts === undefined ? {} : { scripts: input.scripts }),
-      });
+          : { defaultModelSelection: rowFields.defaultModelSelection }),
+        ...(rowFields.autoPull === undefined ? {} : { autoPull: rowFields.autoPull }),
+        ...(rowFields.defaultThreadEnvMode === undefined
+          ? {}
+          : { defaultThreadEnvMode: rowFields.defaultThreadEnvMode }),
+        ...(rowFields.scripts === undefined ? {} : { scripts: rowFields.scripts }),
+      };
+      if (Object.keys(meta).length > 0 || !hasSettingChanges) {
+        yield* commit({
+          type: "project.meta.update",
+          commandId: input.commandId,
+          projectId: input.projectId,
+          ...meta,
+        });
+      }
+      if (inOverrideStore) yield* patchOverrides(input.projectId, changes);
       if (workspaceRoot !== previousRoot) {
         yield* projectEnrichment.invalidate([previousRoot, workspaceRoot]);
       }

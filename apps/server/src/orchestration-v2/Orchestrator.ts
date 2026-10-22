@@ -8288,7 +8288,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const loadProjectionForCommand = <K extends ProjectionRecordField>(
-    command: OrchestrationV2Command,
+    command: OrchestrationV2ServerCommand,
     fields: ReadonlyArray<K>,
     filter?: ProjectionRecordFilter,
   ) =>
@@ -8302,11 +8302,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   const preparedRunState = (
     command: Extract<
-      OrchestrationV2Command,
+      OrchestrationV2ServerCommand,
       {
         readonly type:
           | "prepared-run.release"
           | "prepared-run.progress"
+          | "prepared-run.setup-failed"
           | "prepared-run.fail"
           | "prepared-run.retry";
       }
@@ -8330,8 +8331,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         candidate.type === "command_execution" &&
         candidate.input === WORKSPACE_PREPARATION_INPUT,
     );
+    const runStatusMatches =
+      command.type === "prepared-run.retry"
+        ? run?.status === "failed"
+        : command.type === "prepared-run.setup-failed"
+          ? run !== undefined && run.status !== "preparing"
+          : run?.status === "preparing";
     if (
-      run?.status !== (command.type === "prepared-run.retry" ? "failed" : "preparing") ||
+      run === undefined ||
+      !runStatusMatches ||
       attempt === undefined ||
       rootNode === undefined ||
       providerThread === undefined ||
@@ -8382,31 +8390,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   /**
    * An async setup script finishes after the run was released, so its failure
-   * rewrites the already completed preparation item instead of the run.
+   * rewrites the already completed preparation item instead of the run. Only
+   * a released run's completed item qualifies, so a second report is refused.
    */
   const dispatchPreparedRunSetupFailed = Effect.fn("Orchestrator.dispatchPreparedRunSetupFailed")(
     function* (
-      command: Extract<OrchestrationV2Command, { readonly type: "prepared-run.setup-failed" }>,
+      command: Extract<
+        OrchestrationV2ServerCommand,
+        { readonly type: "prepared-run.setup-failed" }
+      >,
       events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     ) {
-      const projection = yield* loadProjectionForCommand(command, ["runs", "turnItems"], {
-        turnItemTypes: ["command_execution"],
-        turnItemRunId: command.runId,
-      });
-      const preparationItem = projection.turnItems.find(
-        (
-          candidate,
-        ): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "command_execution" }> =>
-          candidate.runId === command.runId &&
-          candidate.type === "command_execution" &&
-          candidate.input === WORKSPACE_PREPARATION_INPUT,
+      const projection = yield* loadProjectionForCommand(
+        command,
+        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
       );
-      const run = projection.runs.find((candidate) => candidate.id === command.runId);
-      if (preparationItem === undefined || run === undefined) {
+      const state = preparedRunState(command, projection);
+      if (state === null || state.preparationItem.status !== "completed") {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: `Run ${command.runId} has no workspace preparation to update.`,
+          cause: `Run ${command.runId} has no released workspace preparation to update.`,
         });
       }
       const now = yield* DateTime.now;
@@ -8416,16 +8421,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       )({
         type: "turn-item.updated",
         threadId: command.threadId,
-        runId: run.id,
-        nodeId: preparationItem.nodeId ?? undefined,
-        providerInstanceId: run.providerInstanceId,
+        runId: state.run.id,
+        nodeId: state.rootNode.id,
+        providerInstanceId: state.run.providerInstanceId,
         occurredAt: now,
         payload: {
-          ...preparationItem,
+          ...state.preparationItem,
           status: "failed",
           title: "Workspace ready, setup script failed",
           output: command.output,
-          exitCode: command.exitCode ?? 1,
+          exitCode: command.exitCode ?? undefined,
           updatedAt: now,
         },
       });
