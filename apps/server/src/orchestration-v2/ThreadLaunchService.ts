@@ -306,6 +306,7 @@ const make = Effect.gen(function* () {
     const tracked = input.workspaceStrategy.type === "worktree" || reused !== undefined;
     let createdWorktreePath: string | null = null;
     let setupTerminalId: string | null = null;
+    let submodulesRan = false;
     let workspaceRecorded = false;
     let runReleased = false;
     // The background branch rename records the worktree again when it lands,
@@ -316,7 +317,7 @@ const make = Effect.gen(function* () {
         threadId,
         branch: input.workspaceStrategy.branch ?? null,
         baseRef: input.workspaceStrategy.baseRef,
-        stages: ["fetch", "checkout", "setup-script", "agent"],
+        stages: ["fetch", "checkout", "submodules", "setup-script", "agent"],
         fiber: yield* Effect.fiber,
       });
     } else if (reused !== undefined) {
@@ -444,10 +445,30 @@ const make = Effect.gen(function* () {
                   }),
                 onCheckoutProgress: (progress) =>
                   setupTracker.stage(threadId, "checkout", { percent: progress.percent }),
+                onSubmodulesStarted: () => {
+                  submodulesRan = true;
+                  return setupTracker.stageStatus(threadId, "submodules", "running");
+                },
+                onSubmoduleLine: (line) => setupTracker.appendTail(threadId, "submodules", line),
+                onSubmodulesDisabled: ({ source }) =>
+                  setupTracker.stageStatus(
+                    threadId,
+                    "submodules",
+                    "skipped",
+                    `Disabled in ${source === "t3.json" ? "t3.json" : "settings"}`,
+                  ),
+                onSubmodulesFinished: ({ ok, detail }) =>
+                  setupTracker.stageStatus(
+                    threadId,
+                    "submodules",
+                    ok ? "done" : "warning",
+                    ok ? null : `Submodules are not initialized: ${detail ?? "unknown error"}`,
+                  ),
               },
             },
           )
           .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+        if (!submodulesRan) yield* setupTracker.stageStatus(threadId, "submodules", "skipped");
         worktreePath = worktree.worktree.path;
         branch = worktree.worktree.refName;
         createdWorktreePath = worktreePath;
@@ -610,12 +631,24 @@ const make = Effect.gen(function* () {
               status: completion.exitCode === 0 ? "done" : "failed",
               detail: `exited with ${completion.exitCode ?? "no exit code"}`,
             });
-            if (completion.exitCode !== 0 && !setup.async)
-              return yield* mapError(
-                input,
-                "run-setup-script",
-                threadId,
-              )(`Setup script exited with ${completion.exitCode ?? "no exit code"}.`);
+            if (completion.exitCode === 0) return;
+            const summary = yield* setupFailureSummary(
+              threadId,
+              setup.scriptName,
+              completion.exitCode,
+            );
+            if (!setup.async) return yield* mapError(input, "run-setup-script", threadId)(summary);
+            if (runId !== null)
+              yield* threads
+                .dispatch({
+                  type: "prepared-run.setup-failed",
+                  commandId: CommandId.make(`${input.commandId}:setup-failed`),
+                  threadId,
+                  runId,
+                  exitCode: completion.exitCode,
+                  output: summary,
+                })
+                .pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
           });
           if (setup.async) {
             awaitAsyncSetup = awaitCompletion.pipe(
@@ -708,6 +741,20 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+  });
+
+  const setupFailureSummary = Effect.fn("ThreadLaunchService.setupFailureSummary")(function* (
+    threadId: ThreadId,
+    scriptName: string,
+    exitCode: number | null,
+  ) {
+    const tail =
+      (yield* setupTracker.get(threadId))?.stages.find((stage) => stage.id === "setup-script")
+        ?.tail ?? [];
+    return [
+      `Setup script "${scriptName}" exited with ${exitCode ?? "no exit code"}.`,
+      ...(tail.length === 0 ? [] : ["Last output:", ...tail]),
+    ].join("\n");
   });
 
   const failPreparedRun = (

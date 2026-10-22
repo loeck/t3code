@@ -26,6 +26,7 @@ import {
   HttpServerResponse,
 } from "effect/http";
 
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as PullRequestReviewGuideService from "../pullRequest/PullRequestReviewGuideService.ts";
 import * as ServerConfig from "../config.ts";
@@ -171,6 +172,7 @@ const layerRecordingTools = (calls: Array<unknown>) => {
         McpToolAccessTestkit.liveThreadsLayer,
         Layer.mock(OrchestratorMcpService.OrchestratorMcpService)({}),
         Layer.mock(ProjectService.ProjectService)({}),
+        ServerSettings.layerTest(),
         NodeServices.layer,
       ),
     ),

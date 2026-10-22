@@ -42,8 +42,10 @@ const shared = {
     Crypto.Crypto,
   ],
 };
+const settingsDependencies = [...shared.dependencies, ServerSettings.ServerSettingsService];
 const ProjectListTool = Tool.make("t3_project_list", {
   ...shared,
+  dependencies: settingsDependencies,
   description:
     "List registered projects in this environment. Pages use the current project snapshot and may shift between calls.",
   parameters: Schema.Struct({
@@ -59,8 +61,9 @@ const ProjectListTool = Tool.make("t3_project_list", {
   .annotate(Tool.Destructive, false);
 const ProjectReadTool = Tool.make("t3_project_read", {
   ...shared,
+  dependencies: settingsDependencies,
   description:
-    "Read a registered project in this environment, including its workspace and saved scripts.",
+    "Read a registered project in this environment, including its workspace and the scripts that effectively run for it.",
   parameters: Schema.Struct({ projectId: ProjectId }),
 })
   .annotate(Tool.Readonly, true)
@@ -78,8 +81,9 @@ const ProjectCreateTool = Tool.make("t3_project_create", {
 }).annotate(Tool.Destructive, true);
 const ProjectUpdateTool = Tool.make("t3_project_update", {
   ...shared,
+  dependencies: settingsDependencies,
   description:
-    "Update a registered project's settings. Omitted fields are preserved. Uses the same project service as the app.",
+    "Update a registered project's settings. Omitted fields are preserved. Scripts are saved where the app's project actions live, so they take effect for new worktrees and settles.",
   parameters: Schema.Struct({ projectId: ProjectId, ...ProjectUpdatePayload.fields }),
 }).annotate(Tool.Destructive, true);
 const ProjectDeleteTool = Tool.make("t3_project_delete", {

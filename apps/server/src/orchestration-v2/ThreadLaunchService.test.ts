@@ -3176,10 +3176,18 @@ it.effect.each([0, 1])("releases an async setup before its completion with exit 
         settled?.stages.find((stage) => stage.id === "setup-script")?.status,
         exitCode === 0 ? "done" : "failed",
       );
-      assert.equal(
-        (yield* threads.getThreadProjection(launched.threadId)).runs[0]?.status,
-        "starting",
+      const finished = yield* threads.getThreadProjection(launched.threadId);
+      assert.equal(finished.runs[0]?.status, "starting");
+      const preparation = finished.turnItems.find(
+        (item) => item.type === "command_execution" && item.input === "Preparing workspace",
       );
+      assert.equal(preparation?.status, exitCode === 0 ? "completed" : "failed");
+      if (exitCode !== 0) {
+        assert.match(
+          preparation?.type === "command_execution" ? (preparation.output ?? "") : "",
+          /Setup script "Setup" exited with 1\./,
+        );
+      }
     }).pipe(Effect.provide(harness.layer));
   }),
 );

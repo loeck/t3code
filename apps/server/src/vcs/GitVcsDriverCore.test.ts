@@ -4413,6 +4413,8 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           '[submodule "missing"]\n\tpath = missing\n\turl = /nonexistent/repo.git\n',
         );
         yield* git(cwd, ["add", "."]);
+        const head = (yield* git(cwd, ["rev-parse", "HEAD"])).trim();
+        yield* git(cwd, ["update-index", "--add", "--cacheinfo", `160000,${head},missing`]);
         yield* git(cwd, ["commit", "-m", "add unreachable submodule"]);
 
         const worktreePath = pathService.join(
@@ -4420,15 +4422,25 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           "broken-submodule-worktree",
         );
         const driver = yield* GitVcsDriver.GitVcsDriver;
-        const created = yield* driver.createWorktree({
-          cwd,
-          path: worktreePath,
-          refName: initialBranch,
-          newRefName: "feature/broken-submodules",
-        });
+        const finished: Array<{ ok: boolean; detail: string | null }> = [];
+        const created = yield* driver.createWorktree(
+          {
+            cwd,
+            path: worktreePath,
+            refName: initialBranch,
+            newRefName: "feature/broken-submodules",
+          },
+          {
+            progress: {
+              onSubmodulesFinished: (result) => Effect.sync(() => void finished.push(result)),
+            },
+          },
+        );
 
         assert.equal(created.worktree.path, worktreePath);
         assert.equal(yield* fileSystem.exists(worktreePath), true);
+        assert.equal(finished.length, 1);
+        assert.equal(finished[0]?.ok, false);
       }),
     );
 

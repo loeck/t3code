@@ -162,6 +162,7 @@ function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<Thread
     case "notification.delivery.accept":
     case "prepared-run.release":
     case "prepared-run.progress":
+    case "prepared-run.setup-failed":
     case "prepared-run.fail":
     case "prepared-run.retry":
     case "subagent.stop":

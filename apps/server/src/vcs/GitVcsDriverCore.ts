@@ -53,6 +53,8 @@ import * as ServerConfig from "../config.ts";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const gitProcesses = Semaphore.makeUnsafe(8);
 const WORKTREE_ADD_TIMEOUT_MS = 300_000;
+const WORKTREE_SUBMODULES_TIMEOUT_MS = 600_000;
+const WORKTREE_SUBMODULES_FORCE_KILL_MS = 5_000;
 const WORKTREE_REMOVE_TIMEOUT_MS = Duration.toMillis(Duration.minutes(5));
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
@@ -3785,12 +3787,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         submoduleMode.value === "recursive"
           ? ["submodule", "update", "--init", "--recursive"]
           : ["submodule", "update", "--init"],
-        onSubmoduleLine
-          ? {
-              env: { LC_ALL: "C" },
-              progress: { onStdoutLine: onSubmoduleLine, onStderrLine: onSubmoduleLine },
-            }
-          : {},
+        {
+          timeoutMs: WORKTREE_SUBMODULES_TIMEOUT_MS,
+          // A timed-out update must not outlive the step: the setup script starts next.
+          forceKillAfterMs: WORKTREE_SUBMODULES_FORCE_KILL_MS,
+          ...(onSubmoduleLine
+            ? {
+                env: { LC_ALL: "C" },
+                progress: { onStdoutLine: onSubmoduleLine, onStderrLine: onSubmoduleLine },
+              }
+            : {}),
+        },
       ).pipe(
         Effect.matchEffect({
           onFailure: (cause) =>
